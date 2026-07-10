@@ -1,0 +1,71 @@
+# Grasp — semantic memory graph + code parser.
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose up
+#
+# Two services: ArcadeDB (graph) + parser (tree-sitter). The MCP server is
+# stdio-mode and is NOT dockerized — your MCP client (Claude Code, Cursor,
+# LM Studio, …) spawns `bun run mcp/server.ts` directly. See README for
+# optional PATTERNS_ROOT wiring if you point it at your own prompt library.
+
+services:
+
+  # ─── Graph database ─────────────────────────────────────────────
+  # ArcadeDB with an initial `grasp` database. Any tool (parser, MCP,
+  # external client) creates its own databases inside this server.
+  arcadedb:
+    image: arcadedata/arcadedb:latest
+    container_name: grasp-arcadedb
+    restart: unless-stopped
+    environment:
+      JAVA_OPTS: >-
+        -Darcadedb.server.rootPassword=${ARCADEDB_ROOT_PASSWORD:-grasp}
+        -Darcadedb.server.defaultDatabases=grasp[root]
+    ports:
+      - "127.0.0.1:2480:2480"    # HTTP API + Studio
+      - "127.0.0.1:2424:2424"    # Binary protocol
+    volumes:
+      - arcadedb-data:/home/arcadedb/databases
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2480 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - grasp
+
+  # ─── Code parser (tree-sitter, 19 languages) ─────────────────────
+  # HTTP server. Reads a git URL, extracts structural facts, writes them into
+  # a per-project database inside ArcadeDB. Docker builds the Python image
+  # from parser/Dockerfile — no host-side pip install needed.
+  parser:
+    build:
+      context: ./parser
+      dockerfile: Dockerfile
+    container_name: grasp-parser
+    restart: unless-stopped
+    environment:
+      - ARCADEDB_URL=http://arcadedb:2480
+      - ARCADEDB_ROOT_PASSWORD=${ARCADEDB_ROOT_PASSWORD:-grasp}
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:-local}
+      - MODE=local
+      - PARSER_PORT=3334
+    ports:
+      - "127.0.0.1:3334:3334"
+    volumes:
+      - parse-workspace:/workspace
+    depends_on:
+      arcadedb:
+        condition: service_healthy
+    networks:
+      - grasp
+
+networks:
+  grasp:
+    driver: bridge
+
+volumes:
+  arcadedb-data:
+  parse-workspace:

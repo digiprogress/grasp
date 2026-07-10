@@ -1,0 +1,15 @@
+{
+  "name": "grasp-graph-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "server.ts",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@types/js-yaml": "^4.0.9",
+    "js-yaml": "^5.2.1",
+    "zod": "^3.23.8"
+  }
+}

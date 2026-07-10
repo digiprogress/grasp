@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+target/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Framework / tooling caches
+.turbo/
+.next/
+.vite/
+.cache/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data volumes
+arcadedb-data/
+
+# Editor
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bun
+bun.lock
