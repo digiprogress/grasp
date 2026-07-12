@@ -292,7 +292,12 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
 
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "indexing", {"files_indexed": 0, "files_total": len(files_to_write)})
         if not skip_arcadedb and arcadedb_url and internal_secret:
-            writer = ArcadeDBWriter(arcadedb_url, internal_secret)
+            # A full (non-incremental) parse is the complete current state of
+            # the repo, so it replaces the project graph: drop first, else the
+            # plain INSERTs stack duplicate vertices on every re-parse.
+            # Incremental parses touch only changed files and must never wipe.
+            clean = (not incremental) or bool(input_data.get("clean", False))
+            writer = ArcadeDBWriter(arcadedb_url, internal_secret, clean=clean)
 
             # Delete removed files first (incremental only)
             if incremental and removed_files:
