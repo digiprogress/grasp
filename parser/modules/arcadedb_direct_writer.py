@@ -180,6 +180,18 @@ class ArcadeDBDirectWriter:
         stmts.append("CREATE INDEX IF NOT EXISTS ON Directory (path) UNIQUE")
         stmts.append("CREATE INDEX IF NOT EXISTS ON File (path) UNIQUE")
         stmts.append("CREATE INDEX IF NOT EXISTS ON Origin (id) UNIQUE")
+        # Edge-write lookup indexes. Every CREATE EDGE below resolves its
+        # endpoints with subqueries like
+        #   (SELECT FROM `Function` WHERE file_path = .. AND name = .. AND line = ..)
+        # Without these, each of the ~70k+ element edges on a large repo does a
+        # full scan over a 30-40k-row type — measured on hermes-agent, that
+        # turned the edge phase from minutes into ~2 hours. NOTUNIQUE on
+        # purpose: these are lookup accelerators, not identity constraints
+        # (same-named elements may legitimately coexist; INSERTs don't care).
+        for vt in ("`Function`", "Method", "Class", "Interface", "Enum"):
+            stmts.append(f"CREATE INDEX IF NOT EXISTS ON {vt} (file_path, name, line) NOTUNIQUE")
+        stmts.append("CREATE INDEX IF NOT EXISTS ON Class (file_path, name) NOTUNIQUE")   # INHERITS target
+        stmts.append("CREATE INDEX IF NOT EXISTS ON Interface (name) NOTUNIQUE")          # IMPLEMENTS target
         self._sql_script(db, stmts)
 
     # ─── main entry ────────────────────────────────────────────────
