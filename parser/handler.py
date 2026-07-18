@@ -25,6 +25,7 @@ import os
 import logging
 import tempfile
 import subprocess
+import threading
 from datetime import datetime, timezone
 import shutil
 import time
@@ -44,6 +45,19 @@ from modules.file_discovery import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# One pipeline per project at a time. local_entry serves over
+# ThreadingHTTPServer and the post-commit hook fire-and-forgets — two rapid
+# commits would otherwise interleave delete_files/INSERT on the same live
+# graph. The second request simply waits; with SHA-based derivation the
+# waiting run then derives whatever the first one didn't cover.
+_project_locks: Dict[str, threading.Lock] = {}
+_project_locks_guard = threading.Lock()
+
+
+def _project_lock(project_name: str) -> threading.Lock:
+    with _project_locks_guard:
+        return _project_locks.setdefault(project_name, threading.Lock())
 
 
 def report_progress(arcadedb_url, internal_secret, user_id, project, stage, detail=None):
@@ -155,6 +169,10 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
     repo_path = None
     parsed_results = []
 
+    # Serialize per project (see _project_lock) — every return path below is
+    # inside the try, so the finally always releases.
+    lock = _project_lock(project_name)
+    lock.acquire()
     try:
         # Step 1: Clone repository
         if repo_url:
@@ -194,9 +212,14 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 reader = ArcadeDBWriter(arcadedb_url, internal_secret)
                 last_sha = reader.read_origin_sha(project_name)
                 if last_sha:
-                    derived = derive_git_changes(repo_path, last_sha)
+                    # Diff in the SOURCE repo when local (it has full
+                    # history; the clone is shallow), pinned to the clone's
+                    # HEAD SHA so the lists match the parsed content.
+                    diff_repo = repo_url if os.path.isdir(repo_url) else repo_path
+                    head_sha = (origin or {}).get("commit") or "HEAD"
+                    derived = derive_git_changes(diff_repo, last_sha, head=head_sha)
                     if derived is None:
-                        logger.info(f"Incremental: cannot diff {last_sha[:12]}..HEAD (shallow clone or unknown SHA)")
+                        logger.info(f"Incremental: cannot diff {last_sha[:12]}..{head_sha[:12]} (no history or unknown SHA)")
                 else:
                     logger.info("Incremental: no Origin SHA in graph (never fully parsed?)")
             if derived is None:
@@ -211,8 +234,9 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 )
                 if not changed_files and not removed_files:
                     # Graph already matches HEAD content-wise; just move the
-                    # base SHA forward so the next derivation starts here.
-                    reader.write(user_id=user_id, project=project_name, files=[], origin=origin)
+                    # base SHA forward (preserving the stored file count) so
+                    # the next derivation starts here.
+                    reader.touch_origin(project_name, origin)
                     result["no_changes"] = True
                     report_completion(arcadedb_url, internal_secret, user_id, project_name, result)
                     report_progress(arcadedb_url, internal_secret, user_id, project_name, "completed")
@@ -316,7 +340,20 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                             project_name, exclude_files=changed_files | removed_files
                         )
                     except Exception as e:
-                        logger.warning(f"graph symbol context unavailable: {e}")
+                        # Abort LOUDLY, graph untouched (nothing deleted yet).
+                        # Resolving against an empty symbol table would write
+                        # a subgraph with silently missing INHERITS edges and
+                        # report success — worse than failing. Base SHA is
+                        # unchanged, so a retry redoes this exact batch.
+                        result["status"] = "failed"
+                        result["error"] = (
+                            f"incremental aborted before any graph mutation: class-symbol "
+                            f"context unavailable ({e}); retry, or run a full parse"
+                        )
+                        logger.error(f"[{project_name}] {result['error']}")
+                        report_completion(arcadedb_url, internal_secret, user_id, project_name, result)
+                        report_progress(arcadedb_url, internal_secret, user_id, project_name, "failed", {"error": result["error"]})
+                        return result
             parsed_results = resolve_references(
                 parsed_results, repo_root=repo_path,
                 all_files=all_files_ctx, extra_symbols=extra_symbols,
@@ -346,9 +383,12 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 f["domain"] = parts[0] if len(parts) > 1 else "root"
 
         # Step 8: Write graph to ArcadeDB
-        # In incremental mode: filter to only changed files, and delete removed files
+        # In incremental mode: filter to only changed files, and delete removed
+        # files. Unconditional on `incremental` (not `and changed_files`): a
+        # removed-only run must write NOTHING, not fall through to the full
+        # passthrough tree.
         files_to_write = parsed_results
-        if incremental and changed_files:
+        if incremental:
             files_to_write = [f for f in parsed_results if f.get("file_path") in changed_files]
             logger.info(f"Incremental mode: writing {len(files_to_write)}/{len(parsed_results)} changed files")
             result["incremental"] = True
@@ -368,7 +408,16 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             # files this run touches (whole graph on a full parse, so files
             # deleted from the repo surface as DELETED). Best-effort: no
             # snapshot just means the diff degrades to first_parse.
-            touched = sorted(changed_files | removed_files) if incremental else None
+            # Only files that PARSED successfully may be deleted: a changed
+            # file that timed out or errored keeps its (stale but present)
+            # subgraph — stale beats a permanent silent hole — and blocks the
+            # base SHA below so it is retried next run.
+            touched = None
+            failed_changed = set()
+            if incremental:
+                parsed_ok = {f.get("file_path") for f in parsed_results}
+                failed_changed = (set(parseable_files) - parsed_ok) if parseable_files else set()
+                touched = sorted((changed_files & parsed_ok) | removed_files)
             pre_state = {}
             try:
                 pre_state = writer.read_element_state(project_name, touched)
@@ -383,7 +432,7 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             saved_edges = []
             if incremental and touched:
                 saved_edges = writer.read_incoming_edges(project_name, touched)
-                logger.info(f"Incremental: rewriting {len(changed_files)} + deleting {len(removed_files)} files "
+                logger.info(f"Incremental: rewriting {len(changed_files & set(touched))} + deleting {len(removed_files)} files "
                             f"({len(saved_edges)} incoming edges captured)")
                 writer.delete_files(user_id, project_name, touched)
                 if removed_files:
@@ -401,7 +450,6 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 project=project_name,
                 files=files_to_write,
                 on_progress=on_index_progress,
-                origin=origin,
             )
             result["arcadedb_stats"] = {
                 "directories": write_result.directories,
@@ -447,10 +495,13 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             try:
                 from modules.graph_diff import compute_diff, parsed_to_elements
 
+                # first_parse only on the full-parse path: an incremental
+                # commit that adds ONLY new files also has an empty scoped
+                # snapshot, and that is a routine diff, not a first parse.
                 diff = compute_diff(
                     pre_state,
                     parsed_to_elements(files_to_write),
-                    first_parse=not pre_state,
+                    first_parse=not pre_state and not incremental,
                 )
                 result["diff"] = diff.summary()
                 if not diff.first_parse and not diff.is_empty():
@@ -466,13 +517,42 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"graph diff step skipped: {e}")
 
+            # Provenance endgame — the base SHA moves ONLY when this run left
+            # the graph consistent at HEAD:
+            #   write failed        → blank the SHA: the next incremental
+            #                         derivation is impossible and falls back
+            #                         to the full parse that repairs the graph
+            #   changed files failed→ keep the OLD SHA: those files' stale
+            #     to parse            subgraphs were kept, and the next run
+            #                         re-derives (and retries) them
+            #   clean success       → advance to HEAD
+            if origin:
+                if not write_result.success:
+                    writer.clear_origin_sha(project_name)
+                    logger.error(f"[{project_name}] base SHA cleared — next incremental run will full-parse")
+                elif incremental and failed_changed:
+                    result["failed_changed_files"] = sorted(failed_changed)[:50]
+                    logger.warning(
+                        f"[{project_name}] {len(failed_changed)} changed file(s) failed to parse — "
+                        f"base SHA kept, they will be retried next run"
+                    )
+                elif incremental:
+                    writer.touch_origin(project_name, origin)
+                else:
+                    writer.touch_origin(project_name, origin, files=len(files_to_write))
+
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "completing")
 
         # Report completion to auth service so Postgres status updates to "ready"
         report_completion(arcadedb_url, internal_secret, user_id, project_name, result)
 
-        # Send terminal event through the same progress channel so SSE clients always get it
-        report_progress(arcadedb_url, internal_secret, user_id, project_name, "completed")
+        # Terminal event through the same progress channel so SSE clients
+        # always get it — and get the TRUE outcome: a rejected-batch failure
+        # must not stream 'completed' while the job reports failed.
+        if result.get("status") == "completed":
+            report_progress(arcadedb_url, internal_secret, user_id, project_name, "completed")
+        else:
+            report_progress(arcadedb_url, internal_secret, user_id, project_name, "failed", {"error": result.get("error", "")})
 
     except Exception as e:
         logger.error(f"Code analysis failed: {e}")
@@ -484,6 +564,7 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "failed", {"error": str(e)})
 
     finally:
+        lock.release()
         if repo_path:
             cleanup_repository(repo_path)
 
@@ -562,12 +643,17 @@ def parse_single_file(args: tuple) -> Dict:
         return {"success": False, "file_path": file_path, "error": str(e)}
 
 
-def derive_git_changes(repo_path: str, last_sha: str):
-    """Changed/removed file lists between the graph's base SHA and HEAD.
+def derive_git_changes(repo_path: str, last_sha: str, head: str = "HEAD"):
+    """Changed/removed file lists between the graph's base SHA and `head`.
+
+    Runs against whichever repo actually HAS the history — for a local
+    source repo that is the source itself, not the shallow clone. `head`
+    should be the clone's HEAD SHA so the lists match the content that gets
+    parsed even if the source gains commits mid-run.
 
     Returns (changed, removed) — repo-relative paths — or None when the diff
-    cannot be computed (SHA not in this clone's history: shallow clone, or a
-    rebased-away commit), in which case the caller falls back to a full parse.
+    cannot be computed (SHA not in history: shallow clone, or a rebased-away
+    commit), in which case the caller falls back to a full parse.
     --no-renames on purpose: a rename must become delete+add, because the
     graph keys elements by file path.
     """
@@ -578,10 +664,11 @@ def derive_git_changes(repo_path: str, last_sha: str):
         )
 
     try:
-        if _git("cat-file", "-e", f"{last_sha}^{{commit}}").returncode != 0:
-            return None
-        changed = _git("diff", "--no-renames", "--name-only", "--diff-filter=ACMR", last_sha, "HEAD")
-        removed = _git("diff", "--no-renames", "--name-only", "--diff-filter=D", last_sha, "HEAD")
+        for sha in (last_sha, head):
+            if _git("cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
+                return None
+        changed = _git("diff", "--no-renames", "--name-only", "--diff-filter=ACMR", last_sha, head)
+        removed = _git("diff", "--no-renames", "--name-only", "--diff-filter=D", last_sha, head)
         if changed.returncode != 0 or removed.returncode != 0:
             return None
         return (
@@ -599,10 +686,11 @@ def clone_repository(repo_url: str, github_token: str = None) -> str:
     If github_token is provided, rewrites the URL to use token auth
     for private repository access via GitHub App installation tokens.
 
-    Local paths are cloned with FULL history (cheap — git hardlinks local
-    objects): the incremental path needs the graph's base SHA in history to
-    diff against. Remote URLs stay shallow; incremental over a remote falls
-    back to a full parse, which is always correct.
+    Always shallow (--depth 1) — the clone only supplies file CONTENT. The
+    incremental path's git history questions run against the SOURCE repo
+    (which has the history), never the clone; a full local clone would
+    physically copy the object store whenever /tmp is a different filesystem
+    (tmpfs, docker) and break the bounded-clone-time invariant.
     """
     try:
         clone_url = repo_url
@@ -611,9 +699,8 @@ def clone_repository(repo_url: str, github_token: str = None) -> str:
             clone_url = repo_url.replace("https://github.com/", f"https://x-access-token:{github_token}@github.com/")
 
         temp_dir = tempfile.mkdtemp(prefix="grasp-parse_")
-        depth = [] if os.path.isdir(repo_url) else ["--depth", "1"]
         subprocess.run(
-            ["git", "clone", *depth, clone_url, temp_dir],
+            ["git", "clone", "--depth", "1", clone_url, temp_dir],
             capture_output=True, text=True, timeout=300, check=True
         )
         logger.info(f"Cloned to {temp_dir}")

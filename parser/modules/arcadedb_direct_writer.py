@@ -346,21 +346,56 @@ class ArcadeDBDirectWriter:
     def read_class_symbols(self, project: str, exclude_files: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
         """Class symbols ({name, file_path, line}) from the existing graph,
         minus the files being re-parsed — the resolver's stand-in for the
-        repo-wide symbol table it would otherwise need a full parse to build."""
+        repo-wide symbol table it would otherwise need a full parse to build.
+
+        RAISES on any read failure instead of returning [] — an empty table
+        would make the resolver silently mark cross-file parents unresolved
+        and the rewrite would drop their INHERITS edges while reporting
+        success. The caller must abort the incremental run instead."""
         db = _sanitize_db_name(project)
+        r = self._sql(db, "SELECT name, file_path, line FROM Class")
+        if r.status_code >= 300:
+            raise RuntimeError(f"class symbol read failed: {r.status_code} {r.text[:150]}")
         out: List[Dict[str, Any]] = []
-        try:
-            r = self._sql(db, "SELECT name, file_path, line FROM Class")
-            if r.status_code >= 300:
-                logger.warning(f"[{db}] read_class_symbols: {r.status_code} {r.text[:150]}")
-                return out
-            skip = exclude_files or set()
-            for row in r.json().get("result", []):
-                if row.get("name") and row.get("file_path") and row["file_path"] not in skip:
-                    out.append({"name": row["name"], "file_path": row["file_path"], "line": row.get("line") or 0})
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[{db}] read_class_symbols failed: {e}")
+        skip = exclude_files or set()
+        for row in r.json().get("result", []):
+            if row.get("name") and row.get("file_path") and row["file_path"] not in skip:
+                out.append({"name": row["name"], "file_path": row["file_path"], "line": row.get("line") or 0})
         return out
+
+    def touch_origin(self, project: str, origin: Dict[str, str], files: Optional[int] = None) -> None:
+        """Advance provenance — ONLY after a successful write/restore. With
+        files=None the stored file count is preserved (the no-changes fast
+        path must not clobber the last full parse's count with 0)."""
+        db = _sanitize_db_name(project)
+        sets = [
+            "id = 'origin'",
+            f"repo = {_sql_str(origin.get('repo'))}",
+            f"commit_sha = {_sql_str(origin.get('commit'))}",
+            f"parsed_at = {_sql_str(origin.get('parsed_at'))}",
+        ]
+        if files is not None:
+            sets.append(f"files = {int(files)}")
+        try:
+            r = self._sql(db, f"UPDATE Origin SET {', '.join(sets)} UPSERT WHERE id = 'origin'")
+            if r.status_code >= 300:
+                logger.warning(f"[{db}] touch_origin failed: {r.status_code} {r.text[:150]}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{db}] touch_origin failed: {e}")
+
+    def clear_origin_sha(self, project: str) -> None:
+        """Poison-pill after a failed write: blank the base SHA so the next
+        incremental derivation is impossible and falls back to a full parse —
+        the path that repairs whatever this failure left behind. Without
+        this, a graph missing half its batches would still claim to be at
+        HEAD and every later incremental run would report no_changes."""
+        db = _sanitize_db_name(project)
+        try:
+            r = self._sql(db, "UPDATE Origin SET commit_sha = '' WHERE id = 'origin'")
+            if r.status_code >= 300:
+                logger.warning(f"[{db}] clear_origin_sha failed: {r.status_code} {r.text[:150]}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{db}] clear_origin_sha failed: {e}")
 
     def read_incoming_edges(self, project: str, file_paths: List[str]) -> List[Dict[str, Any]]:
         """Capture the cross-file edges POINTING INTO the given files, before
@@ -454,7 +489,6 @@ class ArcadeDBDirectWriter:
         project: str,
         files: Optional[List[Dict[str, Any]]] = None,
         on_progress: Optional[Callable[[int, int, WriteResult], None]] = None,
-        origin: Optional[Dict[str, str]] = None,
     ) -> WriteResult:
         result = WriteResult()
         files = files or []
@@ -469,21 +503,12 @@ class ArcadeDBDirectWriter:
             result.error = str(e)
             return result
 
-        # Provenance first: even if element writes fail later, the graph
-        # should record what it was built from. UPSERT keyed on the unique
-        # Origin(id) index so re-parses update the single row in place.
-        if origin:
-            r = self._sql(
-                db,
-                f"UPDATE Origin SET id = 'origin', "
-                f"repo = {_sql_str(origin.get('repo'))}, "
-                f"commit_sha = {_sql_str(origin.get('commit'))}, "
-                f"parsed_at = {_sql_str(origin.get('parsed_at'))}, "
-                f"files = {len(files)} "
-                f"UPSERT WHERE id = 'origin'",
-            )
-            if r.status_code >= 300:
-                logger.warning(f"[{db}] origin write failed: {r.status_code} {r.text[:150]}")
+        # NOTE: Origin (provenance) is deliberately NOT written here. The
+        # base SHA may only advance AFTER the write (and edge restore)
+        # succeeded — advancing it up front means a failed incremental write
+        # leaves the base at HEAD, the retry derives zero changes, and the
+        # hole becomes permanent. The handler calls touch_origin() on
+        # success and clear_origin_sha() on failure.
 
         # Collect unique directory paths
         dir_paths: Set[str] = set()
@@ -586,20 +611,33 @@ class ArcadeDBDirectWriter:
                 result.enums += 1
 
         # ── directory hierarchy (CONTAINS) ─────────────────────────
+        # Delete-then-create, keyed on the CHILD's single incoming CONTAINS
+        # (a dir/file has exactly one parent): incremental writes land in a
+        # live graph where Directory vertices — and their chain edges —
+        # survived delete_files(), so an unconditional CREATE would stack a
+        # duplicate edge on every run. On a fresh (full-parse) DB the DELETE
+        # is a no-op.
         for d in sorted(dir_paths):
             if "/" in d:
                 parent = d.rsplit("/", 1)[0]
+                stmts.append(
+                    f"DELETE FROM (SELECT expand(inE('CONTAINS')) FROM Directory WHERE path = {_sql_str(d)})"
+                )
                 stmts.append(
                     "CREATE EDGE `CONTAINS` "
                     f"FROM (SELECT FROM Directory WHERE path = {_sql_str(parent)}) "
                     f"TO (SELECT FROM Directory WHERE path = {_sql_str(d)})"
                 )
 
-        # dir → file
+        # dir → file (same delete-then-create guard: a changed passthrough
+        # file's vertex may have survived if it was never deleted)
         for f in files:
             fp = f.get("file_path", "")
             parent = "/".join(fp.split("/")[:-1])
             if parent:
+                stmts.append(
+                    f"DELETE FROM (SELECT expand(inE('CONTAINS')) FROM File WHERE path = {_sql_str(fp)})"
+                )
                 stmts.append(
                     "CREATE EDGE `CONTAINS` "
                     f"FROM (SELECT FROM Directory WHERE path = {_sql_str(parent)}) "

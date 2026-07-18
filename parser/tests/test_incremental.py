@@ -71,6 +71,21 @@ def test_derive_unknown_sha_falls_back():
     assert derive_git_changes(repo, "0" * 40) is None
 
 
+def test_derive_pinned_head_ignores_later_commits():
+    # the handler pins head to the CLONE's SHA: commits racing in after the
+    # clone must not leak into the derived lists
+    repo, base = _repo_with_two_commits()
+    pinned = _sha(repo)
+    with open(os.path.join(repo, "late.py"), "w") as f:
+        f.write("def late(): pass\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "raced-in commit")
+    changed, removed = derive_git_changes(repo, base, head=pinned)
+    assert "late.py" not in changed
+    assert sorted(changed) == ["edit.py", "fresh.py"] and removed == ["gone.py"]
+    assert derive_git_changes(repo, base, head="0" * 40) is None  # unknown head → fallback
+
+
 def test_derive_rename_is_delete_plus_add():
     repo, base = _repo_with_two_commits()
     _git(repo, "mv", "keep.py", "kept.py")
