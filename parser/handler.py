@@ -296,6 +296,20 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             clean = (not incremental) or bool(input_data.get("clean", False))
             writer = ArcadeDBWriter(arcadedb_url, internal_secret, clean=clean)
 
+            # Graph diff, step 1: snapshot the OLD graph before write() drops
+            # or mutates it — {anchor_key: [signature_hash]} scoped to the
+            # files this run touches (whole graph on a full parse, so files
+            # deleted from the repo surface as DELETED). Best-effort: no
+            # snapshot just means the diff degrades to first_parse.
+            diff_scope = None
+            if incremental:
+                diff_scope = sorted({f.get("file_path", "") for f in files_to_write} | set(removed_files or []))
+            pre_state = {}
+            try:
+                pre_state = writer.read_element_state(project_name, diff_scope)
+            except Exception as e:
+                logger.warning(f"diff snapshot failed (reporting first_parse): {e}")
+
             # Delete removed files first (incremental only)
             if incremental and removed_files:
                 logger.info(f"Incremental: deleting {len(removed_files)} removed files")
@@ -340,6 +354,33 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                     f"ones; verify with SELECT count(*) per type before trusting it."
                 )
                 logger.error(f"[{project_name}] {result['error']}")
+
+            # Graph diff, step 2: compare the pre-write snapshot against what
+            # this parse produced. Report-only — the graph itself was already
+            # written above; the diff is the answer to "what changed since the
+            # last parse", surfaced in the response and appended to DiffLog in
+            # the primary DB. Never fails the parse.
+            try:
+                from modules.graph_diff import compute_diff, parsed_to_elements
+
+                diff = compute_diff(
+                    pre_state,
+                    parsed_to_elements(files_to_write),
+                    first_parse=not pre_state,
+                )
+                result["diff"] = diff.summary()
+                if not diff.first_parse and not diff.is_empty():
+                    result["diff"]["entries"] = {
+                        "added": diff.added[:200],
+                        "changed": diff.changed[:200],
+                        "deleted": diff.deleted[:200],
+                    }
+                if write_result.success:
+                    writer.write_diff_log(
+                        project_name, diff, trigger=input_data.get("trigger", "manual")
+                    )
+            except Exception as e:
+                logger.warning(f"graph diff step skipped: {e}")
 
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "completing")
 

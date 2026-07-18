@@ -238,6 +238,91 @@ class ArcadeDBDirectWriter:
         stmts.append("CREATE INDEX IF NOT EXISTS ON Interface (name) NOTUNIQUE")          # IMPLEMENTS target
         self._sql_script(db, stmts)
 
+    # ─── graph diff support ────────────────────────────────────────
+    def read_element_state(
+        self, project: str, file_paths: Optional[List[str]] = None
+    ) -> Dict[str, List[str]]:
+        """Snapshot {anchor_key: [signature_hash, ...]} for the code elements
+        currently in the graph, optionally scoped to a set of files. A list per
+        anchor because plain INSERTs let same-named elements coexist. Returns
+        {} when the project DB doesn't exist yet (first parse). Call BEFORE
+        write() — on a clean/full parse write() drops the old graph.
+        """
+        db = _sanitize_db_name(project)
+        try:
+            if db not in self._list_databases():
+                return {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{db}] read_element_state: database list failed: {e}")
+            return {}
+        where = ""
+        if file_paths:
+            plist = ", ".join(_sql_str(p) for p in file_paths)
+            where = f" WHERE file_path IN [{plist}]"
+        state: Dict[str, List[str]] = {}
+        for vt in ("`Function`", "Method", "Class", "Interface", "Enum"):
+            try:
+                r = self._sql(db, f"SELECT anchor_key, signature_hash FROM {vt}{where}")
+                if r.status_code >= 300:
+                    logger.warning(f"[{db}] read_element_state({vt}): {r.status_code} {r.text[:150]}")
+                    continue
+                for row in r.json().get("result", []):
+                    ak = row.get("anchor_key")
+                    if ak:  # rows from before this feature carry no anchor
+                        state.setdefault(ak, []).append(row.get("signature_hash"))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[{db}] read_element_state({vt}) failed: {e}")
+        return state
+
+    # DiffLog lives in the primary `grasp` DB (the one docker-compose seeds),
+    # NOT in the per-project DB: full parses drop the project DB, and a log
+    # that dies with every rebuild is not a log. Read it back with the MCP
+    # `query` tool: SELECT FROM DiffLog WHERE project = '<p>' ORDER BY ts DESC.
+    DIFFLOG_DB = "grasp"
+    DIFFLOG_MAX_ENTRIES = 500
+
+    def write_diff_log(self, project: str, diff: Any, trigger: str = "manual") -> None:
+        """Persist one DiffLog row for a parse. Best-effort: a logging failure
+        must never fail the parse."""
+        try:
+            from datetime import datetime, timezone
+
+            self._sql_script(self.DIFFLOG_DB, [
+                "CREATE VERTEX TYPE DiffLog IF NOT EXISTS BUCKETS 8",
+                "CREATE PROPERTY DiffLog.project IF NOT EXISTS STRING",
+                "CREATE PROPERTY DiffLog.ts IF NOT EXISTS STRING",
+                "CREATE PROPERTY DiffLog.trigger IF NOT EXISTS STRING",
+                "CREATE PROPERTY DiffLog.summary IF NOT EXISTS STRING",
+                "CREATE PROPERTY DiffLog.entries IF NOT EXISTS STRING",
+                "CREATE INDEX IF NOT EXISTS ON DiffLog (project) NOTUNIQUE",
+            ])
+            entries = {
+                "added": diff.added[: self.DIFFLOG_MAX_ENTRIES],
+                "changed": diff.changed[: self.DIFFLOG_MAX_ENTRIES],
+                "deleted": diff.deleted[: self.DIFFLOG_MAX_ENTRIES],
+            }
+            truncated = {
+                k: len(getattr(diff, k)) - len(v)
+                for k, v in entries.items()
+                if len(getattr(diff, k)) > len(v)
+            }
+            summary = diff.summary()
+            if truncated:
+                summary["entries_truncated"] = truncated  # never lie by omission
+            r = self._sql(
+                self.DIFFLOG_DB,
+                "INSERT INTO DiffLog SET "
+                f"project = {_sql_str(_sanitize_db_name(project))}, "
+                f"ts = {_sql_str(datetime.now(timezone.utc).isoformat())}, "
+                f"trigger = {_sql_str(trigger)}, "
+                f"summary = {_sql_str(json.dumps(summary))}, "
+                f"entries = {_sql_str(json.dumps(entries))}",
+            )
+            if r.status_code >= 300:
+                logger.warning(f"DiffLog write failed: {r.status_code} {r.text[:150]}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"DiffLog write skipped: {e}")
+
     # ─── main entry ────────────────────────────────────────────────
     def write(
         self,
