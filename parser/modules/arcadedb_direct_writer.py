@@ -323,6 +323,128 @@ class ArcadeDBDirectWriter:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"DiffLog write skipped: {e}")
 
+    # ─── incremental support ───────────────────────────────────────
+    def read_origin_sha(self, project: str) -> Optional[str]:
+        """The commit SHA the graph was last built from (Origin vertex), or
+        None when the project has never been parsed. This is the base the
+        incremental path diffs against — the graph itself remembers where it
+        stands, so triggers don't have to."""
+        db = _sanitize_db_name(project)
+        try:
+            if db not in self._list_databases():
+                return None
+            r = self._sql(db, "SELECT commit_sha FROM Origin WHERE id = 'origin'")
+            if r.status_code < 300:
+                rows = r.json().get("result", [])
+                return (rows[0].get("commit_sha") or None) if rows else None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{db}] read_origin_sha failed: {e}")
+        return None
+
+    def read_class_symbols(self, project: str, exclude_files: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+        """Class symbols ({name, file_path, line}) from the existing graph,
+        minus the files being re-parsed — the resolver's stand-in for the
+        repo-wide symbol table it would otherwise need a full parse to build."""
+        db = _sanitize_db_name(project)
+        out: List[Dict[str, Any]] = []
+        try:
+            r = self._sql(db, "SELECT name, file_path, line FROM Class")
+            if r.status_code >= 300:
+                logger.warning(f"[{db}] read_class_symbols: {r.status_code} {r.text[:150]}")
+                return out
+            skip = exclude_files or set()
+            for row in r.json().get("result", []):
+                if row.get("name") and row.get("file_path") and row["file_path"] not in skip:
+                    out.append({"name": row["name"], "file_path": row["file_path"], "line": row.get("line") or 0})
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{db}] read_class_symbols failed: {e}")
+        return out
+
+    def read_incoming_edges(self, project: str, file_paths: List[str]) -> List[Dict[str, Any]]:
+        """Capture the cross-file edges POINTING INTO the given files, before
+        delete_files() severs them with the vertices. The unchanged side of
+        each edge still exists after the rewrite, so these records are enough
+        to re-tie the graph: restore_edges() replays them once the files'
+        fresh vertices are written."""
+        db = _sanitize_db_name(project)
+        edges: List[Dict[str, Any]] = []
+        queries = [
+            # other file --IMPORTS--> this file
+            ("IMPORTS", lambda fp: (
+                f"SELECT outV().path AS src FROM (SELECT expand(inE('IMPORTS')) FROM File WHERE path = {_sql_str(fp)})"
+            )),
+            # other file's class --INHERITS--> a class in this file
+            ("INHERITS", lambda fp: (
+                "SELECT outV().file_path AS src_file, outV().name AS src_name, inV().name AS dst_name "
+                f"FROM (SELECT expand(inE('INHERITS')) FROM Class WHERE file_path = {_sql_str(fp)})"
+            )),
+            # other file's class --IMPLEMENTS--> an interface in this file
+            ("IMPLEMENTS", lambda fp: (
+                "SELECT outV().file_path AS src_file, outV().name AS src_name, inV().name AS dst_name "
+                f"FROM (SELECT expand(inE('IMPLEMENTS')) FROM Interface WHERE file_path = {_sql_str(fp)})"
+            )),
+        ]
+        for fp in file_paths:
+            for etype, q in queries:
+                try:
+                    r = self._sql(db, q(fp))
+                    if r.status_code >= 300:
+                        continue
+                    for row in r.json().get("result", []):
+                        if etype == "IMPORTS":
+                            if row.get("src"):
+                                edges.append({"type": "IMPORTS", "src_file": row["src"], "dst_file": fp})
+                        elif row.get("src_file") and row.get("src_name") and row.get("dst_name"):
+                            edges.append({
+                                "type": etype, "src_file": row["src_file"],
+                                "src_name": row["src_name"], "dst_file": fp,
+                                "dst_name": row["dst_name"],
+                            })
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[{db}] read_incoming_edges({etype}, {fp}) failed: {e}")
+        return edges
+
+    def restore_edges(
+        self, project: str, edges: List[Dict[str, Any]], skip_src_files: Optional[Set[str]] = None
+    ) -> Tuple[int, int]:
+        """Replay captured incoming edges after the rewrite. Edges whose source
+        file was itself re-parsed are skipped — write() already rebuilt that
+        file's outgoing edges from the fresh parse. A restore whose target
+        vanished (element deleted/renamed) is a silent no-op on this ArcadeDB
+        build (empty endpoint set → no edge, no error): counted as dropped,
+        and the graph diff already reports that element as deleted."""
+        db = _sanitize_db_name(project)
+        skip = skip_src_files or set()
+        restored = dropped = 0
+        for e in edges:
+            if e["src_file"] in skip:
+                continue
+            if e["type"] == "IMPORTS":
+                stmt = (
+                    "CREATE EDGE IMPORTS "
+                    f"FROM (SELECT FROM File WHERE path = {_sql_str(e['src_file'])}) "
+                    f"TO (SELECT FROM File WHERE path = {_sql_str(e['dst_file'])})"
+                )
+            else:
+                dst_type = "Class" if e["type"] == "INHERITS" else "Interface"
+                stmt = (
+                    f"CREATE EDGE {e['type']} "
+                    f"FROM (SELECT FROM Class WHERE file_path = {_sql_str(e['src_file'])} AND name = {_sql_str(e['src_name'])}) "
+                    f"TO (SELECT FROM {dst_type} WHERE file_path = {_sql_str(e['dst_file'])} AND name = {_sql_str(e['dst_name'])})"
+                )
+            try:
+                r = self._sql(db, stmt)
+                if r.status_code < 300 and r.json().get("result"):
+                    restored += 1
+                else:
+                    dropped += 1
+            except Exception as ex:  # noqa: BLE001
+                logger.warning(f"[{db}] edge restore failed ({e['type']} {e['src_file']}): {ex}")
+                dropped += 1
+        if restored or dropped:
+            logger.info(f"[{db}] edge restore: {restored} restored, {dropped} dropped (target vanished)")
+        return restored, dropped
+
     # ─── main entry ────────────────────────────────────────────────
     def write(
         self,
@@ -368,24 +490,34 @@ class ArcadeDBDirectWriter:
                 dir_paths.add(d)
 
         # ── vertices ────────────────────────────────────────────────
+        # Directory and File are UPSERTs (backed by their unique path
+        # indexes): an incremental write lands in a LIVE graph where these
+        # rows already exist, and a plain INSERT would violate the index.
+        # Elements stay plain INSERTs — in incremental mode delete_files()
+        # cleared the touched files' elements first, and a full parse starts
+        # from a dropped DB. (Verified on this ArcadeDB build: rows UPSERTed
+        # earlier in a sqlscript ARE visible to CREATE EDGE endpoint
+        # subqueries later in the same script.)
         stmts: List[str] = []
         for d in sorted(dir_paths):
             depth = d.count("/") + 1
             name = d.rsplit("/", 1)[-1]
             stmts.append(
-                f"INSERT INTO Directory SET path = {_sql_str(d)}, name = {_sql_str(name)}, depth = {depth}"
+                f"UPDATE Directory SET path = {_sql_str(d)}, name = {_sql_str(name)}, "
+                f"depth = {depth} UPSERT WHERE path = {_sql_str(d)}"
             )
         result.directories = len(dir_paths)
 
         for f in files:
             fp = f.get("file_path", "")
             stmts.append(
-                "INSERT INTO File SET "
+                "UPDATE File SET "
                 f"path = {_sql_str(fp)}, "
                 f"name = {_sql_str(os.path.basename(fp))}, "
                 f"language = {_sql_str(f.get('language', 'unknown'))}, "
                 f"domain = {_sql_str(f.get('domain'))}, "
-                f"summary = {_sql_str(f.get('summary'))}"
+                f"summary = {_sql_str(f.get('summary'))} "
+                f"UPSERT WHERE path = {_sql_str(fp)}"
             )
             result.files += 1
 

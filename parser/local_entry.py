@@ -87,6 +87,17 @@ class Handler(BaseHTTPRequestHandler):
         }
         if payload.get("clean"):
             input_data["clean"] = True
+        # Incremental re-parse (the post-commit hook's mode): the parser
+        # derives changed/removed itself, from the graph's Origin SHA to
+        # HEAD — callers may pass explicit lists but don't need to.
+        if payload.get("incremental"):
+            input_data["incremental"] = True
+            if payload.get("changed_files"):
+                input_data["changed_files"] = payload["changed_files"]
+            if payload.get("removed_files"):
+                input_data["removed_files"] = payload["removed_files"]
+        if payload.get("trigger"):
+            input_data["trigger"] = payload["trigger"]
 
         logger.info(f"received parse request: repo={repo} project={project}")
         try:

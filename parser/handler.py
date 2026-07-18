@@ -4,8 +4,10 @@ Grasp Parser Handler — modular tree-sitter analysis pipeline.
 Orchestrates the full analysis pipeline:
 1. Code Analysis: clone → discover → parse in parallel → resolve →
    assign domains (depth-1) → write graph (+ origin provenance)
-2. Incremental: clone → discover → parse all → write only changed files →
-   delete removed files
+2. Incremental: clone → derive changed/removed from git (graph's Origin SHA
+   → HEAD) → parse ONLY changed files (resolver context comes from the graph
+   + discovery) → capture incoming edges → per-file delete + rewrite →
+   restore edges → graph diff
 
 The graph (structural + keyword search over ArcadeDB) is the primary
 retrieval mechanism. All heavy lifting lives in modules/.
@@ -128,7 +130,12 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
     skip_arcadedb = input_data.get("skip_arcadedb", False)
     github_token = input_data.get("github_token")
 
-    # Incremental mode: parse all (resolver needs full symbol table), write only changed
+    # Incremental mode: parse ONLY the changed files (the resolver borrows the
+    # rest of its context from the graph), rewrite them per-file, delete the
+    # removed ones. changed/removed may be supplied by the caller; when absent
+    # they are derived here from git against the SHA the graph was built at
+    # (Origin.commit_sha) — so a missed trigger is just a bigger next batch,
+    # never silent drift.
     incremental = input_data.get("incremental", False)
     changed_files = set(input_data.get("changed_files", []))
     removed_files = set(input_data.get("removed_files", []))
@@ -177,6 +184,40 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 "parsed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
 
+        # Incremental without explicit lists: derive changed/removed from git,
+        # from the graph's own base SHA to HEAD. Any reason this can't work
+        # (never parsed, shallow history, unknown SHA) falls back to a full
+        # parse — the path that is always correct.
+        if incremental and not changed_files and not removed_files:
+            derived = None
+            if repo_path and not skip_arcadedb and arcadedb_url:
+                reader = ArcadeDBWriter(arcadedb_url, internal_secret)
+                last_sha = reader.read_origin_sha(project_name)
+                if last_sha:
+                    derived = derive_git_changes(repo_path, last_sha)
+                    if derived is None:
+                        logger.info(f"Incremental: cannot diff {last_sha[:12]}..HEAD (shallow clone or unknown SHA)")
+                else:
+                    logger.info("Incremental: no Origin SHA in graph (never fully parsed?)")
+            if derived is None:
+                logger.info("Incremental: falling back to full parse")
+                incremental = False
+            else:
+                changed_files, removed_files = set(derived[0]), set(derived[1])
+                result["incremental_base"] = last_sha
+                logger.info(
+                    f"Incremental: {len(changed_files)} changed, {len(removed_files)} removed "
+                    f"since {last_sha[:12]}"
+                )
+                if not changed_files and not removed_files:
+                    # Graph already matches HEAD content-wise; just move the
+                    # base SHA forward so the next derivation starts here.
+                    reader.write(user_id=user_id, project=project_name, files=[], origin=origin)
+                    result["no_changes"] = True
+                    report_completion(arcadedb_url, internal_secret, user_id, project_name, result)
+                    report_progress(arcadedb_url, internal_secret, user_id, project_name, "completed")
+                    return result
+
         # Step 2: Discover files
         skipped_oversize: List[Dict[str, Any]] = []
         files = discover_code_files(repo_path, file_discovery_config, skipped_oversize)
@@ -209,6 +250,15 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 parsed_results.append({"file_path": f, "language": lang, "parse_mode": "passthrough"})
             else:
                 parseable_files.append(f)
+
+        # Incremental: tree-sitter only the changed files — this is the whole
+        # point of the mode (2 changed files in a 10k-file repo = 2 parses).
+        # Passthrough entries above still cover the full tree: they cost no
+        # parsing and give the resolver its config/context files.
+        if incremental:
+            all_discovered = set(files)
+            parseable_files = [f for f in parseable_files if f in changed_files]
+            logger.info(f"Incremental: parsing {len(parseable_files)} changed files (of {len(all_discovered)} discovered)")
 
         num_workers = min(cpu_count(), 16)
         logger.info(f"Parsing {len(parseable_files)}/{len(files)} parseable files with {num_workers} workers")
@@ -251,9 +301,26 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
         logger.info(f"Parsed {len(parsed_results)} files")
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "analyzing", {"files_parsed": len(parsed_results)})
 
-        # Step 5: Resolve cross-file references
+        # Step 5: Resolve cross-file references. On an incremental parse only
+        # the changed files were parsed, so the resolver gets the rest of the
+        # repo as context: the discovered file list (import targets) and the
+        # graph's class symbols (inheritance targets) — no full parse needed.
         if parsed_results:
-            parsed_results = resolve_references(parsed_results, repo_root=repo_path)
+            extra_symbols = None
+            all_files_ctx = None
+            if incremental:
+                all_files_ctx = set(files)
+                if not skip_arcadedb and arcadedb_url:
+                    try:
+                        extra_symbols = ArcadeDBWriter(arcadedb_url, internal_secret).read_class_symbols(
+                            project_name, exclude_files=changed_files | removed_files
+                        )
+                    except Exception as e:
+                        logger.warning(f"graph symbol context unavailable: {e}")
+            parsed_results = resolve_references(
+                parsed_results, repo_root=repo_path,
+                all_files=all_files_ctx, extra_symbols=extra_symbols,
+            )
             resolved_inheritance = sum(
                 1 for r in parsed_results
                 for c in r.get("classes", [])
@@ -301,20 +368,26 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             # files this run touches (whole graph on a full parse, so files
             # deleted from the repo surface as DELETED). Best-effort: no
             # snapshot just means the diff degrades to first_parse.
-            diff_scope = None
-            if incremental:
-                diff_scope = sorted({f.get("file_path", "") for f in files_to_write} | set(removed_files or []))
+            touched = sorted(changed_files | removed_files) if incremental else None
             pre_state = {}
             try:
-                pre_state = writer.read_element_state(project_name, diff_scope)
+                pre_state = writer.read_element_state(project_name, touched)
             except Exception as e:
                 logger.warning(f"diff snapshot failed (reporting first_parse): {e}")
 
-            # Delete removed files first (incremental only)
-            if incremental and removed_files:
-                logger.info(f"Incremental: deleting {len(removed_files)} removed files")
-                writer.delete_files(user_id, project_name, list(removed_files))
-                result["removed_files_count"] = len(removed_files)
+            # Incremental rewrite, step 1: capture the cross-file edges that
+            # point INTO the files being rewritten (their unchanged sources
+            # survive; the edges die with the deleted vertices), then delete
+            # the touched files' subgraphs. write() re-inserts the changed
+            # files fresh; restore_edges() re-ties the incoming edges after.
+            saved_edges = []
+            if incremental and touched:
+                saved_edges = writer.read_incoming_edges(project_name, touched)
+                logger.info(f"Incremental: rewriting {len(changed_files)} + deleting {len(removed_files)} files "
+                            f"({len(saved_edges)} incoming edges captured)")
+                writer.delete_files(user_id, project_name, touched)
+                if removed_files:
+                    result["removed_files_count"] = len(removed_files)
 
             def on_index_progress(files_indexed, files_total, graph_result=None):
                 detail = {"files_indexed": files_indexed, "files_total": files_total}
@@ -354,6 +427,17 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                     f"ones; verify with SELECT count(*) per type before trusting it."
                 )
                 logger.error(f"[{project_name}] {result['error']}")
+
+            # Incremental rewrite, step 2: re-tie the captured incoming edges
+            # to the freshly written vertices. Sources that were themselves
+            # re-parsed are skipped (write() already rebuilt their edges);
+            # restores whose target vanished are dropped — the diff below
+            # reports those elements as deleted.
+            if incremental and saved_edges and write_result.success:
+                restored, dropped = writer.restore_edges(
+                    project_name, saved_edges, skip_src_files=changed_files
+                )
+                result["edge_restore"] = {"restored": restored, "dropped": dropped}
 
             # Graph diff, step 2: compare the pre-write snapshot against what
             # this parse produced. Report-only — the graph itself was already
@@ -478,11 +562,47 @@ def parse_single_file(args: tuple) -> Dict:
         return {"success": False, "file_path": file_path, "error": str(e)}
 
 
+def derive_git_changes(repo_path: str, last_sha: str):
+    """Changed/removed file lists between the graph's base SHA and HEAD.
+
+    Returns (changed, removed) — repo-relative paths — or None when the diff
+    cannot be computed (SHA not in this clone's history: shallow clone, or a
+    rebased-away commit), in which case the caller falls back to a full parse.
+    --no-renames on purpose: a rename must become delete+add, because the
+    graph keys elements by file path.
+    """
+    def _git(*args):
+        return subprocess.run(
+            ["git", "-C", repo_path, *args],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    try:
+        if _git("cat-file", "-e", f"{last_sha}^{{commit}}").returncode != 0:
+            return None
+        changed = _git("diff", "--no-renames", "--name-only", "--diff-filter=ACMR", last_sha, "HEAD")
+        removed = _git("diff", "--no-renames", "--name-only", "--diff-filter=D", last_sha, "HEAD")
+        if changed.returncode != 0 or removed.returncode != 0:
+            return None
+        return (
+            [l.strip() for l in changed.stdout.splitlines() if l.strip()],
+            [l.strip() for l in removed.stdout.splitlines() if l.strip()],
+        )
+    except Exception as e:
+        logger.warning(f"derive_git_changes failed: {e}")
+        return None
+
+
 def clone_repository(repo_url: str, github_token: str = None) -> str:
     """Clone a git repository to a temporary directory.
 
     If github_token is provided, rewrites the URL to use token auth
     for private repository access via GitHub App installation tokens.
+
+    Local paths are cloned with FULL history (cheap — git hardlinks local
+    objects): the incremental path needs the graph's base SHA in history to
+    diff against. Remote URLs stay shallow; incremental over a remote falls
+    back to a full parse, which is always correct.
     """
     try:
         clone_url = repo_url
@@ -491,8 +611,9 @@ def clone_repository(repo_url: str, github_token: str = None) -> str:
             clone_url = repo_url.replace("https://github.com/", f"https://x-access-token:{github_token}@github.com/")
 
         temp_dir = tempfile.mkdtemp(prefix="grasp-parse_")
+        depth = [] if os.path.isdir(repo_url) else ["--depth", "1"]
         subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, temp_dir],
+            ["git", "clone", *depth, clone_url, temp_dir],
             capture_output=True, text=True, timeout=300, check=True
         )
         logger.info(f"Cloned to {temp_dir}")

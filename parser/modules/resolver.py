@@ -240,14 +240,14 @@ class Resolver:
         logger.info(f"Loaded {len(self.path_aliases)} path aliases from {tsconfig_path}")
         logger.debug(f"Path aliases: {self.path_aliases}")
 
-    def _load_workspace_packages(self, parsed_results: List[Dict]):
+    def _load_workspace_packages(self, parsed_results: List[Dict], all_files: Optional[Set[str]] = None):
         """
         Detect local workspace packages (monorepo) and add as path aliases.
 
         Maps package names like '@vendure/core' to their local source directories,
         enabling cross-package import resolution in monorepos.
         """
-        all_file_paths = {r.get("file_path", "") for r in parsed_results if r.get("file_path")}
+        all_file_paths = set(all_files) if all_files else {r.get("file_path", "") for r in parsed_results if r.get("file_path")}
         if not all_file_paths:
             return
 
@@ -310,12 +310,24 @@ class Resolver:
             logger.info(f"Loaded {count} workspace package aliases")
             logger.debug(f"Workspace aliases: {dict(list({k: v for k, v in self.path_aliases.items() if '/' in k and not k.startswith('@/') and not k.startswith('~/')}.items())[:10])}")
 
-    def resolve(self, parsed_results: List[Dict]) -> List[Dict]:
+    def resolve(
+        self,
+        parsed_results: List[Dict],
+        all_files: Optional[Set[str]] = None,
+        extra_symbols: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
         """
         Main entry point. Resolves cross-file import paths and inheritance.
 
         Args:
             parsed_results: List of parsed file results from tree-sitter
+            all_files: optional full file-path universe for import resolution.
+                On an incremental parse only the changed files are parsed, but
+                their imports still point at the rest of the repo — this set
+                (from file discovery, no parsing needed) stands in for them.
+            extra_symbols: optional class symbols ({name, file_path, line})
+                sourced from the existing graph, standing in for the classes
+                of files that were not re-parsed this run.
 
         Returns:
             Same list with resolved import paths and inheritance added
@@ -327,17 +339,19 @@ class Resolver:
             self._load_tsconfig_paths(parsed_results)
 
         # Step 0b: Detect workspace packages for cross-package import resolution
-        self._load_workspace_packages(parsed_results)
+        self._load_workspace_packages(parsed_results, all_files)
 
         # Step 0c: Detect Dart package name from pubspec.yaml
         self._load_dart_package_name(parsed_results)
 
         # Step 1: Build symbol table from all files
         self._build_symbol_table(parsed_results)
+        if extra_symbols:
+            self._merge_extra_symbols(extra_symbols, parsed_results)
         logger.info(f"Built symbol table with {len(self.symbols)} unique names")
 
         # Step 2: Build import map for each file
-        self._build_import_maps(parsed_results)
+        self._build_import_maps(parsed_results, all_files)
 
         # Step 3: Resolve inheritance
         resolved_inheritance = 0
@@ -408,11 +422,30 @@ class Resolver:
 
             self.file_exports[file_path] = exports
 
-    def _build_import_maps(self, parsed_results: List[Dict]):
+    def _merge_extra_symbols(self, extra_symbols: List[Dict], parsed_results: List[Dict]):
+        """Merge graph-sourced class symbols into the table, for files that
+        were not parsed this run. A parsed file's fresh symbols always win:
+        extras belonging to a parsed file are stale by definition and skipped."""
+        parsed_files = {r.get("file_path", "") for r in parsed_results}
+        merged = 0
+        for s in extra_symbols:
+            name, fp = s.get("name"), s.get("file_path")
+            if not name or not fp or fp in parsed_files:
+                continue
+            self.symbols.setdefault(name, []).append(Symbol(
+                name=name, file_path=fp, line=int(s.get("line") or 0),
+                symbol_type="class", is_exported=True,
+            ))
+            merged += 1
+        if merged:
+            logger.info(f"Merged {merged} class symbols from the existing graph")
+
+    def _build_import_maps(self, parsed_results: List[Dict], all_files: Optional[Set[str]] = None):
         """Build import resolution map for each file."""
 
-        # Collect all file paths for resolution
-        all_files = {r.get("file_path", "") for r in parsed_results}
+        # Collect all file paths for resolution — the full discovered universe
+        # when provided (incremental), else the parsed set (full parse).
+        all_files = set(all_files) if all_files else {r.get("file_path", "") for r in parsed_results}
 
         for file_result in parsed_results:
             file_path = file_result.get("file_path", "")
@@ -596,14 +629,23 @@ class Resolver:
         return None
 
 
-def resolve_references(parsed_results: List[Dict], repo_root: str = None) -> List[Dict]:
+def resolve_references(
+    parsed_results: List[Dict],
+    repo_root: str = None,
+    all_files: Optional[Set[str]] = None,
+    extra_symbols: Optional[List[Dict]] = None,
+) -> List[Dict]:
     """
     Convenience function to resolve all cross-file references.
 
     Usage:
         parsed_results = resolve_references(parsed_results, repo_root="/tmp/repo")
+
+    all_files / extra_symbols supply the unparsed rest of the repo on an
+    incremental parse (file universe from discovery, class symbols from the
+    graph) — see Resolver.resolve.
     """
     resolver = Resolver()
     if repo_root:
         resolver.project_root = repo_root
-    return resolver.resolve(parsed_results)
+    return resolver.resolve(parsed_results, all_files=all_files, extra_symbols=extra_symbols)
