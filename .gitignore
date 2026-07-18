@@ -46,3 +46,4 @@ Thumbs.db
 # Bun
 bun.lock
 /.venv-dev/
+docker-compose.override.yml
