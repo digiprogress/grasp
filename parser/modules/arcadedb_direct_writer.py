@@ -287,11 +287,13 @@ class ArcadeDBDirectWriter:
         try:
             from datetime import datetime, timezone
 
+            # `cause`, not `trigger`: TRIGGER is a reserved word in ArcadeDB
+            # SQL and breaks both CREATE PROPERTY and every consumer's WHERE.
             self._sql_script(self.DIFFLOG_DB, [
                 "CREATE VERTEX TYPE DiffLog IF NOT EXISTS BUCKETS 8",
                 "CREATE PROPERTY DiffLog.project IF NOT EXISTS STRING",
                 "CREATE PROPERTY DiffLog.ts IF NOT EXISTS STRING",
-                "CREATE PROPERTY DiffLog.trigger IF NOT EXISTS STRING",
+                "CREATE PROPERTY DiffLog.cause IF NOT EXISTS STRING",
                 "CREATE PROPERTY DiffLog.summary IF NOT EXISTS STRING",
                 "CREATE PROPERTY DiffLog.entries IF NOT EXISTS STRING",
                 "CREATE INDEX IF NOT EXISTS ON DiffLog (project) NOTUNIQUE",
@@ -314,7 +316,7 @@ class ArcadeDBDirectWriter:
                 "INSERT INTO DiffLog SET "
                 f"project = {_sql_str(_sanitize_db_name(project))}, "
                 f"ts = {_sql_str(datetime.now(timezone.utc).isoformat())}, "
-                f"trigger = {_sql_str(trigger)}, "
+                f"cause = {_sql_str(trigger)}, "
                 f"summary = {_sql_str(json.dumps(summary))}, "
                 f"entries = {_sql_str(json.dumps(entries))}",
             )
@@ -696,10 +698,13 @@ class ArcadeDBDirectWriter:
         db = _sanitize_db_name(project)
         stmts: List[str] = []
         for fp in files:
-            # Delete owned elements first, then the File vertex itself
+            # Delete owned elements first, then the File vertex itself.
+            # (DELETE FROM, not DELETE VERTEX — this ArcadeDB build has no
+            # DELETE VERTEX statement; the original spelling made this method
+            # fail on its first-ever live call.)
             for kind in ("`Function`", "Method", "Class", "Interface", "Enum"):
                 stmts.append(f"DELETE FROM {kind} WHERE file_path = {_sql_str(fp)}")
-            stmts.append(f"DELETE VERTEX File WHERE path = {_sql_str(fp)}")
+            stmts.append(f"DELETE FROM File WHERE path = {_sql_str(fp)}")
         try:
             r = self._sql_script(db, stmts)
             if r.status_code >= 300:
