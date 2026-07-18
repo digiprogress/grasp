@@ -3,7 +3,7 @@ Grasp Parser Handler — modular tree-sitter analysis pipeline.
 
 Orchestrates the full analysis pipeline:
 1. Code Analysis: clone → discover → parse in parallel → resolve →
-   orchestrate → community → write graph
+   assign domains (depth-1) → write graph (+ origin provenance)
 2. Incremental: clone → discover → parse all → write only changed files →
    delete removed files
 
@@ -23,6 +23,7 @@ import os
 import logging
 import tempfile
 import subprocess
+from datetime import datetime, timezone
 import shutil
 import time
 import multiprocessing
@@ -33,7 +34,6 @@ import httpx
 from modules import (
     TreeSitterParser, ArcadeDBWriter,
     FileDiscoveryConfig, resolve_references,
-    orchestrate_file,
 )
 from modules.file_discovery import (
     BLOCKED_DIRECTORIES, BLOCKED_EXTENSIONS, LOCK_FILENAMES,
@@ -158,6 +158,25 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 return failed
             report_progress(arcadedb_url, internal_secret, user_id, project_name, "cloning")
 
+        # Provenance: which repo and commit this graph describes. Clones are
+        # temporary (cleaned up at the end of this job) while the graph lives
+        # on — without this record a graph can outlive its source with no way
+        # to tell what revision it maps or how to re-fetch it.
+        origin = None
+        if repo_url and repo_path:
+            try:
+                sha = subprocess.run(
+                    ["git", "-C", repo_path, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+            except Exception:
+                sha = ""
+            origin = {
+                "repo": repo_url,
+                "commit": sha,
+                "parsed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+
         # Step 2: Discover files
         files = discover_code_files(repo_path, file_discovery_config)
         logger.info(f"Discovered {len(files)} code files")
@@ -243,43 +262,18 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             }
             logger.info(f"Resolved {resolved_inheritance} inheritance")
 
-        # Step 6: Orchestrate semantic skeletons
+        # Step 6: Assign domains — plain top-level directory, nothing smarter.
+        # The old adaptive nesting (split domains over 50 files ever deeper)
+        # produced hundreds of path-shaped "domains" on large repos (367 on a
+        # 5.7k-file repo) — noise that every consumer then had to re-derive
+        # depth-1 from. Depth-1 is the only level with stable, human-scale
+        # cardinality (2-23 measured across parsed projects). Finer grouping
+        # is a query-time concern (Directory nodes carry the full tree), not
+        # a parse-time one.
         if parsed_results:
-            for file_result in parsed_results:
-                if file_result.get("parse_mode") == "passthrough":
-                    file_result["skeleton"] = {
-                        "identity": {
-                            "file": file_result.get("file_path"),
-                            "language": file_result.get("language"),
-                            "parse_mode": "passthrough",
-                        }
-                    }
-                else:
-                    file_result["skeleton"] = orchestrate_file(file_result)
-            logger.info(f"Orchestrated {len(parsed_results)} semantic skeletons")
-
-        # Step 7: Assign directory-based domains (adaptive nesting)
-        if parsed_results:
-            MAX_DOMAIN_FILES = 50
-
-            def assign_domains(files, depth=1):
-                # Group by domain at current depth
-                domains = {}
-                for f in files:
-                    parts = f.get("file_path", "").split("/")
-                    domain = "/".join(parts[:depth]) if len(parts) > depth else ("root" if depth == 1 else "/".join(parts[:-1]) or "root")
-                    f["domain"] = domain
-                    domains.setdefault(domain, []).append(f)
-
-                # Split oversized domains by going one level deeper
-                for domain_name, domain_files in domains.items():
-                    if len(domain_files) > MAX_DOMAIN_FILES and domain_name != "root":
-                        # Only recurse if deeper splitting can produce new groups
-                        max_parts = max(len(f.get("file_path", "").split("/")) for f in domain_files)
-                        if depth < max_parts:
-                            assign_domains(domain_files, depth + 1)
-
-            assign_domains(parsed_results)
+            for f in parsed_results:
+                parts = f.get("file_path", "").split("/")
+                f["domain"] = parts[0] if len(parts) > 1 else "root"
 
         # Step 8: Write graph to ArcadeDB
         # In incremental mode: filter to only changed files, and delete removed files
@@ -317,6 +311,7 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 project=project_name,
                 files=files_to_write,
                 on_progress=on_index_progress,
+                origin=origin,
             )
             result["arcadedb_stats"] = {
                 "directories": write_result.directories,

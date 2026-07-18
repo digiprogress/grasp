@@ -72,7 +72,7 @@ class ArcadeDBDirectWriter:
     # Schema definitions — mirrored from the legacy manager
     VERTEX_TYPES = [
         "Directory", "File", "Function", "Method", "Class",
-        "Interface", "Enum",
+        "Interface", "Enum", "Origin",
     ]
     EDGE_TYPES = [
         "CONTAINS", "IMPORTS", "INHERITS", "IMPLEMENTS",
@@ -82,7 +82,12 @@ class ArcadeDBDirectWriter:
         "Directory.path STRING", "Directory.name STRING", "Directory.depth INTEGER",
         # File
         "File.path STRING", "File.name STRING", "File.language STRING",
-        "File.domain STRING", "File.layer STRING", "File.summary STRING", "File.skeleton STRING",
+        "File.domain STRING", "File.summary STRING",
+        # Provenance: single-row record of where this graph came from. The
+        # clone is temporary, the graph is not — without this a graph can
+        # outlive its source with no way to tell what revision it maps.
+        "Origin.id STRING", "Origin.repo STRING", "Origin.commit_sha STRING",
+        "Origin.parsed_at STRING", "Origin.files INTEGER",
         # Function
         "`Function`.file_path STRING", "`Function`.name STRING",
         "`Function`.line INTEGER", "`Function`.end_line INTEGER",
@@ -174,6 +179,7 @@ class ArcadeDBDirectWriter:
         # Unique indexes for the key vertex types
         stmts.append("CREATE INDEX IF NOT EXISTS ON Directory (path) UNIQUE")
         stmts.append("CREATE INDEX IF NOT EXISTS ON File (path) UNIQUE")
+        stmts.append("CREATE INDEX IF NOT EXISTS ON Origin (id) UNIQUE")
         self._sql_script(db, stmts)
 
     # ─── main entry ────────────────────────────────────────────────
@@ -183,6 +189,7 @@ class ArcadeDBDirectWriter:
         project: str,
         files: Optional[List[Dict[str, Any]]] = None,
         on_progress: Optional[Callable[[int, int, WriteResult], None]] = None,
+        origin: Optional[Dict[str, str]] = None,
     ) -> WriteResult:
         result = WriteResult()
         files = files or []
@@ -196,6 +203,22 @@ class ArcadeDBDirectWriter:
             result.success = False
             result.error = str(e)
             return result
+
+        # Provenance first: even if element writes fail later, the graph
+        # should record what it was built from. UPSERT keyed on the unique
+        # Origin(id) index so re-parses update the single row in place.
+        if origin:
+            r = self._sql(
+                db,
+                f"UPDATE Origin SET id = 'origin', "
+                f"repo = {_sql_str(origin.get('repo'))}, "
+                f"commit_sha = {_sql_str(origin.get('commit'))}, "
+                f"parsed_at = {_sql_str(origin.get('parsed_at'))}, "
+                f"files = {len(files)} "
+                f"UPSERT WHERE id = 'origin'",
+            )
+            if r.status_code >= 300:
+                logger.warning(f"[{db}] origin write failed: {r.status_code} {r.text[:150]}")
 
         # Collect unique directory paths
         dir_paths: Set[str] = set()
@@ -221,9 +244,7 @@ class ArcadeDBDirectWriter:
                 f"name = {_sql_str(os.path.basename(fp))}, "
                 f"language = {_sql_str(f.get('language', 'unknown'))}, "
                 f"domain = {_sql_str(f.get('domain'))}, "
-                f"layer = {_sql_str(f.get('layer'))}, "
-                f"summary = {_sql_str(f.get('summary'))}, "
-                f"skeleton = {_sql_str(f.get('skeleton'))}"
+                f"summary = {_sql_str(f.get('summary'))}"
             )
             result.files += 1
 
