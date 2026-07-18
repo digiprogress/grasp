@@ -16,7 +16,14 @@ from typing import List, Set
 class FileDiscoveryConfig:
     """Configuration for file discovery with blocklist approach."""
 
-    max_file_size: int = 512_000  # 500KB default
+    # 2MB. The old 500KB default silently swallowed exactly the wrong files:
+    # on hermes-agent the five casualties were gateway/run.py (1MB — the file
+    # that wires every adapter to the agent), cli.py, hermes_cli/web_server.py,
+    # hermes_cli/main.py and tui_gateway/server.py — the orchestrator tier.
+    # Big files correlate with centrality, so a low cap systematically deletes
+    # the middle of the code map. Binaries are excluded by extension anyway;
+    # this cap only exists to skip multi-MB generated/minified code.
+    max_file_size: int = 2_000_000
     include_patterns: List[str] = field(default_factory=list)
     exclude_patterns: List[str] = field(default_factory=list)
     folder: str = ""  # Only parse files under this subfolder prefix
@@ -26,7 +33,7 @@ class FileDiscoveryConfig:
         """Create config from job input data."""
         fd = input_data.get("file_discovery", {})
         return cls(
-            max_file_size=fd.get("max_file_size", 512_000),
+            max_file_size=fd.get("max_file_size", 2_000_000),
             include_patterns=fd.get("include", []),
             exclude_patterns=fd.get("exclude", []),
             folder=fd.get("folder", ""),

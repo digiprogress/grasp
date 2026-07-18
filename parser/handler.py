@@ -178,7 +178,10 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
             }
 
         # Step 2: Discover files
-        files = discover_code_files(repo_path, file_discovery_config)
+        skipped_oversize: List[Dict[str, Any]] = []
+        files = discover_code_files(repo_path, file_discovery_config, skipped_oversize)
+        if skipped_oversize:
+            result["skipped_oversize"] = skipped_oversize
         logger.info(f"Discovered {len(files)} code files")
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "discovered", {"files_total": len(files)})
 
@@ -367,11 +370,22 @@ def parse_single_file(args: tuple) -> Dict:
         if not language:
             return {"success": False, "file_path": file_path, "error": "No language detected"}
 
-        # Content guards: skip files that could hang tree-sitter
-        MAX_CONTENT_BYTES = 1_000_000  # 1MB
-        MAX_LINES = 20_000
+        # Content guards: skip files that could hang tree-sitter. Kept in sync
+        # with discovery's max_file_size (2MB) — when this cap is LOWER than
+        # discovery's, a file lands in the graph as a File vertex with zero
+        # elements, which reads as "empty file", not "unparsed file". That
+        # exact silent gap hid gateway/run.py (1,048,932 bytes, 21,573 lines —
+        # fan-in 212, the gateway's wiring hub) behind the old 1MB/20k caps.
+        # Genuinely pathological files are minified bundles, and those are
+        # caught by the line-length heuristic below, not by honest size.
+        MAX_CONTENT_BYTES = 2_000_000
+        MAX_LINES = 40_000
         line_count = content.count('\n')
         if len(content) > MAX_CONTENT_BYTES or line_count > MAX_LINES:
+            logger.warning(
+                f"PASSTHROUGH oversize code file: {file_path} ({len(content)} bytes, "
+                f"{line_count} lines) — File vertex only, no elements in the graph"
+            )
             return {"success": True, "file_path": file_path, "language": language, "parse_mode": "passthrough"}
 
         # Detect minified: few lines but very long average line
@@ -441,9 +455,14 @@ def cleanup_repository(repo_path: str):
         logger.warning(f"Cleanup failed: {e}")
 
 
-def discover_code_files(repo_path: str, config: FileDiscoveryConfig = None) -> List[str]:
+def discover_code_files(repo_path: str, config: FileDiscoveryConfig = None,
+                        skipped_oversize: List[Dict[str, Any]] = None) -> List[str]:
     """
     Discover all code files in repository using blocklist approach.
+
+    If `skipped_oversize` is passed (a list), code files rejected by the size
+    cap are appended to it as {"path", "bytes"} so the caller can report them —
+    a graph must never be silently smaller than the repo it claims to map.
     """
     if config is None:
         config = FileDiscoveryConfig()
@@ -485,6 +504,16 @@ def discover_code_files(repo_path: str, config: FileDiscoveryConfig = None) -> L
             try:
                 file_size = os.path.getsize(full_path)
                 if file_size > config.max_file_size:
+                    # Never skip a CODE file silently: an absent File vertex is
+                    # indistinguishable from "does not exist", and oversized
+                    # files are disproportionately the central ones.
+                    if parser.get_language(full_path):
+                        logger.warning(
+                            f"SKIPPED oversize code file: {rel_path} ({file_size} bytes > "
+                            f"{config.max_file_size} cap) — it will be MISSING from the graph"
+                        )
+                        if skipped_oversize is not None:
+                            skipped_oversize.append({"path": rel_path, "bytes": file_size})
                     continue
                 if file_size == 0:
                     continue
