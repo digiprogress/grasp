@@ -13,6 +13,7 @@ a fresh re-parse.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +66,42 @@ def _dir_parts(path: str) -> List[str]:
     return ["/".join(parts[: i + 1]) for i in range(len(parts))]
 
 
+# ─── element identity (graph diff) ─────────────────────────────────────────
+# anchor_key: a stable, line-free name for a code element — the identity the
+# diff engine compares across parses. Stored as a plain property; NOT a
+# uniqueness constraint (same-named elements may coexist, INSERTs don't care).
+def anchor_key(kind: str, file_path: str, name: str, class_name: Optional[str] = None) -> str:
+    if kind == "method":
+        return f"method:{file_path}:{class_name or ''}.{name}"
+    return f"{kind}:{file_path}:{name}"
+
+
+# signature_hash: change detector, not identity. Same anchor + different hash
+# = the element's interface changed. Built from interface-shape fields only
+# (params, return type, flags, parents) — deliberately not the body, so a
+# body-only edit does not read as a change. The `sig1:` prefix versions the
+# algorithm: if the basis ever changes, old hashes are detectably stale
+# instead of silently flagging every element as changed.
+def _sig_hash(kind: str, el: Dict[str, Any]) -> str:
+    if kind == "function":
+        basis = (
+            f"function|{el.get('name')}|p={el.get('params')}|rt={el.get('return_type')}"
+            f"|async={bool(el.get('is_async'))}|exp={bool(el.get('is_exported'))}"
+        )
+    elif kind == "method":
+        basis = (
+            f"method|{el.get('class_name')}.{el.get('name')}|p={el.get('params')}"
+            f"|rt={el.get('return_type')}|async={bool(el.get('is_async'))}"
+        )
+    elif kind == "class":
+        parents = sorted(str(p.get("name")) for p in (el.get("resolved_parents") or []) if p.get("name"))
+        impls = sorted(str(i) for i in (el.get("implements") or []))
+        basis = f"class|{el.get('name')}|ext={','.join(parents)}|impl={','.join(impls)}"
+    else:  # interface / enum — name is all the parser captures today
+        basis = f"{kind}|{el.get('name')}"
+    return "sig1:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+
 # ─── writer ───────────────────────────────────────────────────────────────
 class ArcadeDBDirectWriter:
     """Direct-to-ArcadeDB implementation of the parser writer contract."""
@@ -106,6 +143,12 @@ class ArcadeDBDirectWriter:
         "Interface.line INTEGER", "Interface.end_line INTEGER",
         "Enum.file_path STRING", "Enum.name STRING",
         "Enum.line INTEGER", "Enum.end_line INTEGER",
+        # Element identity for the graph diff (see anchor_key/_sig_hash above)
+        "`Function`.anchor_key STRING", "`Function`.signature_hash STRING",
+        "Method.anchor_key STRING", "Method.signature_hash STRING",
+        "Class.anchor_key STRING", "Class.signature_hash STRING",
+        "Interface.anchor_key STRING", "Interface.signature_hash STRING",
+        "Enum.anchor_key STRING", "Enum.signature_hash STRING",
     ]
     INDEXES = [
         # Unique keys make the "check-then-create" idempotency work.
@@ -269,7 +312,9 @@ class ArcadeDBDirectWriter:
                     f"line = {int(fn.get('line') or 0)}, end_line = {int(fn.get('end_line') or 0)}, "
                     f"is_exported = {str(bool(fn.get('is_exported'))).lower()}, "
                     f"is_async = {str(bool(fn.get('is_async'))).lower()}, "
-                    f"return_type = {_sql_str(fn.get('return_type'))}"
+                    f"return_type = {_sql_str(fn.get('return_type'))}, "
+                    f"anchor_key = {_sql_str(anchor_key('function', fp, fn.get('name')))}, "
+                    f"signature_hash = {_sql_str(_sig_hash('function', fn))}"
                 )
                 result.functions += 1
 
@@ -281,7 +326,9 @@ class ArcadeDBDirectWriter:
                     f"params = {_sql_str(m.get('params'))}, "
                     f"line = {int(m.get('line') or 0)}, end_line = {int(m.get('end_line') or 0)}, "
                     f"is_async = {str(bool(m.get('is_async'))).lower()}, "
-                    f"return_type = {_sql_str(m.get('return_type'))}"
+                    f"return_type = {_sql_str(m.get('return_type'))}, "
+                    f"anchor_key = {_sql_str(anchor_key('method', fp, m.get('name'), m.get('class_name')))}, "
+                    f"signature_hash = {_sql_str(_sig_hash('method', m))}"
                 )
                 result.methods += 1
 
@@ -289,7 +336,9 @@ class ArcadeDBDirectWriter:
                 stmts.append(
                     "INSERT INTO Class SET "
                     f"file_path = {_sql_str(fp)}, name = {_sql_str(c.get('name'))}, "
-                    f"line = {int(c.get('line') or 0)}, end_line = {int(c.get('end_line') or 0)}"
+                    f"line = {int(c.get('line') or 0)}, end_line = {int(c.get('end_line') or 0)}, "
+                    f"anchor_key = {_sql_str(anchor_key('class', fp, c.get('name')))}, "
+                    f"signature_hash = {_sql_str(_sig_hash('class', c))}"
                 )
                 result.classes += 1
 
@@ -299,7 +348,9 @@ class ArcadeDBDirectWriter:
                 stmts.append(
                     "INSERT INTO Interface SET "
                     f"file_path = {_sql_str(fp)}, name = {_sql_str(i.get('name'))}, "
-                    f"line = {int(i.get('line') or 0)}, end_line = {int(i.get('end_line') or 0)}"
+                    f"line = {int(i.get('line') or 0)}, end_line = {int(i.get('end_line') or 0)}, "
+                    f"anchor_key = {_sql_str(anchor_key('interface', fp, i.get('name')))}, "
+                    f"signature_hash = {_sql_str(_sig_hash('interface', i))}"
                 )
                 result.interfaces += 1
 
@@ -309,7 +360,9 @@ class ArcadeDBDirectWriter:
                 stmts.append(
                     "INSERT INTO Enum SET "
                     f"file_path = {_sql_str(fp)}, name = {_sql_str(e.get('name'))}, "
-                    f"line = {int(e.get('line') or 0)}, end_line = {int(e.get('end_line') or 0)}"
+                    f"line = {int(e.get('line') or 0)}, end_line = {int(e.get('end_line') or 0)}, "
+                    f"anchor_key = {_sql_str(anchor_key('enum', fp, e.get('name')))}, "
+                    f"signature_hash = {_sql_str(_sig_hash('enum', e))}"
                 )
                 result.enums += 1
 
