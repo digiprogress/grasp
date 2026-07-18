@@ -531,6 +531,18 @@ class QueryExtractor:
             })
         return interfaces
 
+    def _params_text(self, node, ctx: ExtractionContext) -> Optional[str]:
+        """Raw parameter-list text, e.g. "(self, event: MessageEvent)".
+        The `parameters` field name is shared across the tree-sitter grammars
+        we parse (python, JS/TS, rust, go, java), so one lookup covers them
+        all. Whitespace-collapsed and capped — this is a signature for a
+        navigator deciding whether to hop into the source, not a full AST."""
+        p = node.child_by_field_name("parameters")
+        if not p:
+            return None
+        txt = " ".join(self._text(p, ctx).split())
+        return txt[:300] or None
+
     def _extract_functions(
         self, nodes: List, grouped: Dict, ctx: ExtractionContext
     ) -> List[Dict]:
@@ -558,6 +570,7 @@ class QueryExtractor:
 
             functions.append({
                 "name": name,
+                "params": self._params_text(func_node, ctx),
                 "return_type": return_type,
                 "is_async": any(c.type == "async" for c in func_node.children),
                 "is_exported": self._is_exported(node, ctx, name),
@@ -601,6 +614,7 @@ class QueryExtractor:
             methods.append({
                 "name": name,
                 "class_name": class_name,
+                "params": self._params_text(node, ctx),
                 "return_type": return_type,
                 "is_static": is_static,
                 "is_abstract": is_abstract,

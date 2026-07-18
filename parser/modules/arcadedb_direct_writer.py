@@ -90,6 +90,7 @@ class ArcadeDBDirectWriter:
         "Origin.parsed_at STRING", "Origin.files INTEGER",
         # Function
         "`Function`.file_path STRING", "`Function`.name STRING",
+        "`Function`.params STRING", "Method.params STRING",
         "`Function`.line INTEGER", "`Function`.end_line INTEGER",
         "`Function`.is_exported BOOLEAN", "`Function`.is_async BOOLEAN",
         "`Function`.return_type STRING",
@@ -264,6 +265,7 @@ class ArcadeDBDirectWriter:
                 stmts.append(
                     "INSERT INTO `Function` SET "
                     f"file_path = {_sql_str(fp)}, name = {_sql_str(fn.get('name'))}, "
+                    f"params = {_sql_str(fn.get('params'))}, "
                     f"line = {int(fn.get('line') or 0)}, end_line = {int(fn.get('end_line') or 0)}, "
                     f"is_exported = {str(bool(fn.get('is_exported'))).lower()}, "
                     f"is_async = {str(bool(fn.get('is_async'))).lower()}, "
@@ -276,6 +278,7 @@ class ArcadeDBDirectWriter:
                     "INSERT INTO Method SET "
                     f"file_path = {_sql_str(fp)}, class_name = {_sql_str(m.get('class_name'))}, "
                     f"name = {_sql_str(m.get('name'))}, "
+                    f"params = {_sql_str(m.get('params'))}, "
                     f"line = {int(m.get('line') or 0)}, end_line = {int(m.get('end_line') or 0)}, "
                     f"is_async = {str(bool(m.get('is_async'))).lower()}, "
                     f"return_type = {_sql_str(m.get('return_type'))}"
