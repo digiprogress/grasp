@@ -326,6 +326,21 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
                 "errors": write_result.errors,
             }
 
+            # These counts are what the writer ATTEMPTED, not what landed: a
+            # rejected batch still counts here. So never report success on a
+            # write that had failures — a graph that lies about its own
+            # completeness is worse than one that fails loudly. Callers read
+            # the code map off this graph and cannot tell a missing subsystem
+            # from an absent one.
+            if not write_result.success:
+                result["status"] = "failed"
+                result["error"] = (
+                    f"{write_result.errors} write batch(es) were rejected — the graph is "
+                    f"INCOMPLETE. arcadedb_stats above are attempted counts, not landed "
+                    f"ones; verify with SELECT count(*) per type before trusting it."
+                )
+                logger.error(f"[{project_name}] {result['error']}")
+
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "completing")
 
         # Report completion to auth service so Postgres status updates to "ready"
