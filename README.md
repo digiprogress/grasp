@@ -103,6 +103,33 @@ curl -X POST http://localhost:3334/parse \
 The parser downloads, runs tree-sitter, and writes a fresh database in
 ArcadeDB named after the project.
 
+**Keep it in sync — incremental re-parse:**
+
+After the first parse, you don't have to rebuild the whole graph when code
+changes. An incremental re-parse touches only the files that changed since
+the graph was last built, reports what was added / changed / deleted, and
+leaves the rest of the graph untouched:
+
+```bash
+curl -X POST http://localhost:3334/parse \
+  -H "Content-Type: application/json" \
+  -d '{"repo": "https://github.com/some-org/some-repo", "project": "some-repo", "incremental": true}'
+```
+
+The parser works out the changed set itself (from the commit the graph was
+built at, to HEAD), so you never compute a diff by hand. To make it
+automatic, install a post-commit hook — every commit then re-syncs the
+graph in the background:
+
+```bash
+python parser/hooks/install_git_hook.py --repo /path/to/repo --project some-repo
+```
+
+Each parse also returns a `diff` (added/changed/deleted element counts) and
+records one row in a `DiffLog` — so "what changed since the last parse" is
+answerable at any time. Pass `"clean": true` instead to force a full
+from-scratch rebuild.
+
 **Inspect the graph in your browser:**
 
 Open [http://localhost:2480](http://localhost:2480) and log in as `root`
