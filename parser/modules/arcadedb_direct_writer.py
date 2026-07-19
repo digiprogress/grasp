@@ -117,8 +117,13 @@ class ArcadeDBDirectWriter:
     PROPERTIES = [
         # Directory
         "Directory.path STRING", "Directory.name STRING", "Directory.depth INTEGER",
-        # File
-        "File.path STRING", "File.name STRING", "File.language STRING",
+        # File. `file_path` mirrors `path` so that a traversal can project the
+        # containing file of ANY vertex uniformly: code elements carry
+        # `file_path`, a File carries its own. Without it, `outV().file_path`
+        # over an IMPORTS/CONTAINS edge silently returns null when the endpoint
+        # is a File (its own key is `path`). `path` stays the canonical,
+        # unique-indexed key; `file_path` is projection sugar only.
+        "File.path STRING", "File.file_path STRING", "File.name STRING", "File.language STRING",
         "File.domain STRING", "File.summary STRING",
         # Provenance: single-row record of where this graph came from. The
         # clone is temporary, the graph is not — without this a graph can
@@ -540,6 +545,7 @@ class ArcadeDBDirectWriter:
             stmts.append(
                 "UPDATE File SET "
                 f"path = {_sql_str(fp)}, "
+                f"file_path = {_sql_str(fp)}, "
                 f"name = {_sql_str(os.path.basename(fp))}, "
                 f"language = {_sql_str(f.get('language', 'unknown'))}, "
                 f"domain = {_sql_str(f.get('domain'))}, "
