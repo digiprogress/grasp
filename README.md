@@ -13,6 +13,15 @@ a persistent, traversable understanding of any codebase:
   `parse_repo`, `query`, `get_schema`, `create_vertex`, `create_edge`, and
   a bring-your-own-patterns `run_pattern`.
 
+**The graph maps; the source explains.** Grasp deliberately stores
+*structure* — the threads between things (imports, inheritance, containment,
+signatures) — not file contents. It gets an agent to the right function or
+file fast; the agent then reads the source there for what the code actually
+*does*. Navigation is a graph problem, comprehension is a reading problem,
+and keeping them separate is why the graph stays small, language-agnostic,
+and honest. Query the graph to find the place; open the source to understand
+it.
+
 No embeddings, no vector search, no external accounts. Runs on your
 machine, one Docker command plus one Bun subprocess.
 
