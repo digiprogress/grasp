@@ -19,8 +19,8 @@ signatures) — not file contents. It gets an agent to the right function or
 file fast; the agent then reads the source there for what the code actually
 *does*. Navigation is a graph problem, comprehension is a reading problem,
 and keeping them separate is why the graph stays small, language-agnostic,
-and honest. Query the graph to find the place; open the source to understand
-it.
+and honest. Query the graph to find the place; read the raw files to
+understand it.
 
 No embeddings, no vector search, no external accounts. Runs on your
 machine, one Docker command plus one Bun subprocess.
