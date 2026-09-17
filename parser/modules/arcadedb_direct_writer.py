@@ -219,7 +219,13 @@ class ArcadeDBDirectWriter:
             name = f"`{v}`" if v == "Function" else v
             stmts.append(f"CREATE VERTEX TYPE {name} IF NOT EXISTS BUCKETS 8")
         for e in self.EDGE_TYPES:
-            stmts.append(f"CREATE EDGE TYPE {e} IF NOT EXISTS BUCKETS 8")
+            # Always quoted: CONTAINS is a reserved word in ArcadeDB SQL (the
+            # `field CONTAINS value` operator), so an unquoted CREATE EDGE TYPE
+            # fails to parse. sqlscript is one transaction, so that single
+            # statement took the whole schema down with it. Every CREATE EDGE
+            # below already quotes the type name; this is the one place that
+            # didn't.
+            stmts.append(f"CREATE EDGE TYPE `{e}` IF NOT EXISTS BUCKETS 8")
         for prop in self.PROPERTIES:
             # PROPERTIES entries look like "TypeName.field TYPE"; ArcadeDB SQL wants
             # IF NOT EXISTS *before* the datatype, not after.
@@ -241,7 +247,13 @@ class ArcadeDBDirectWriter:
             stmts.append(f"CREATE INDEX IF NOT EXISTS ON {vt} (file_path, name, line) NOTUNIQUE")
         stmts.append("CREATE INDEX IF NOT EXISTS ON Class (file_path, name) NOTUNIQUE")   # INHERITS target
         stmts.append("CREATE INDEX IF NOT EXISTS ON Interface (name) NOTUNIQUE")          # IMPLEMENTS target
-        self._sql_script(db, stmts)
+        r = self._sql_script(db, stmts)
+        # sqlscript commits as one transaction: any rejected statement leaves
+        # the database with NO schema at all. Unchecked, the first write batch
+        # is what reports it, as a misleading "Type with name 'Directory' was
+        # not found" — the real cause already several steps behind. Fail here.
+        if r.status_code >= 300:
+            raise RuntimeError(f"schema script rejected: {r.status_code} {r.text}")
 
     # ─── graph diff support ────────────────────────────────────────
     def read_element_state(
