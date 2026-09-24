@@ -250,8 +250,9 @@ def handle_code_analysis(input_data: Dict) -> Dict[str, Any]:
         logger.info(f"Discovered {len(files)} code files")
         report_progress(arcadedb_url, internal_secret, user_id, project_name, "discovered", {"files_total": len(files)})
 
-        # Enforce file limit
-        MAX_FILES = 10000
+        # Enforce file limit. Override with MAX_FILES for larger repositories;
+        # the default was raised from 10000 after parsing a 26k-file codebase.
+        MAX_FILES = int(os.environ.get("MAX_FILES", "40000"))
         if len(files) > MAX_FILES:
             logger.warning(f"Repository has {len(files)} files, exceeds limit of {MAX_FILES}")
             cleanup_repository(repo_path)
